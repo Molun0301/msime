@@ -9,13 +9,14 @@ use super::decode::{
 };
 use super::neural::NeuralReranker;
 use super::{LatticeLookup, TypoEdgeSource};
+use crate::pinyin::jianpin::{has_mixed_pinyin_segments, matches_lattice_segments};
 use crate::pinyin::syllables::has_only_complete_pinyin_segments;
 use crate::types::{CandidateSource, WordItem};
 
 // 短句子合并直接扫描已有行，避免默认小批次为临时哈希表分配堆内存。
 const SMALL_SENTENCE_MERGE: usize = 64;
 
-/// Decode `syllables` and insert the sentence rows (Generated, and the NeuralKeyboard pick when the keyboard reranker is given) as one block at `whole_sentence_insert_position`. Nothing for fewer than two syllables or an incomplete one. With `typo_source` and three or more syllables, also returns the typo sentence for the caller to place; the source receives the literal best path and returns the planned typo edges.
+/// 将完整拼音或带完整开头的混输解成整句，插入完整覆盖的词库候选之后；混输读音必须由词典补全，不额外运行拼写纠错。
 #[allow(clippy::too_many_arguments)]
 pub fn merge_lattice_candidates(
     candidates: &mut Vec<WordItem>,
@@ -27,18 +28,25 @@ pub fn merge_lattice_candidates(
     rerankers: &mut [NeuralReranker],
     rescoring_context: &str,
 ) -> Option<TypoSentence> {
-    // Two syllables are enough since lattice_reading: a two-syllable key can miss the exact lookup and otherwise leave prefix-range rows ahead of the sentence. Abbreviated segments (g'k't) are refused so `canonical_pinyin` stays a complete pronunciation (WL:541-545).
-    if syllables.len() < 2 || !has_only_complete_pinyin_segments(syllables) {
+    let complete = has_only_complete_pinyin_segments(syllables);
+    if syllables.len() < 2 || (!complete && !has_mixed_pinyin_segments(syllables)) {
         return None;
     }
-    let graph = build_graph(syllables, lookup, options);
+    let mut canonical_lookup = |span: &[String]| {
+        let mut rows = lookup(span);
+        if !complete {
+            rows.retain(|row| matches_lattice_segments(&row.key, span));
+        }
+        rows
+    };
+    let graph = build_graph(syllables, &mut canonical_lookup, options);
     let mut paths = decode_graph(&graph, options, None);
     if paths.is_empty() {
         return None;
     }
     // Typo spans cover two or three syllables, so a shorter input would only ever be replaced whole. Decoded from the same graph so the dictionary is not asked twice, and from the unreranked best so the typo sentence answers the literal reading.
     let typo = match typo_source {
-        Some(source) if syllables.len() >= 3 => {
+        Some(source) if complete && syllables.len() >= 3 => {
             let edges = source(&paths[0]);
             if edges.is_empty() {
                 None
@@ -243,6 +251,7 @@ pub fn whole_sentence_insert_position(candidates: &[WordItem], syllables: &[Stri
     }
     let typed_key = syllables.join("'");
     let n = syllables.len();
+    let mixed = has_mixed_pinyin_segments(syllables);
     candidates
         .iter()
         .take_while(|item| {
@@ -251,6 +260,9 @@ pub fn whole_sentence_insert_position(candidates: &[WordItem], syllables: &[Stri
                     covers_all_syllables(item, n)
                 } else {
                     item.canonical_pinyin == typed_key
+                        || (mixed
+                            && item.pinyin == typed_key
+                            && matches_lattice_segments(&item.canonical_pinyin, syllables))
                 }
         })
         .count()

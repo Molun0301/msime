@@ -1715,6 +1715,41 @@ INSERT INTO tbl_3_n VALUES('ni''hao''ma','nhm','你好吗',900);",
     assert!(session.snapshot().preedit.is_empty());
 }
 
+#[test]
+fn mixed_jianpin_lattice_commits_and_learns_the_complete_reading() {
+    let fixture = Fixture::new(
+        "CREATE TABLE tbl_1_h(key TEXT,jp TEXT,value TEXT,weight INTEGER);\
+INSERT INTO tbl_1_h VALUES('hen','h','很',50000);\
+CREATE TABLE tbl_2_h(key TEXT,jp TEXT,value TEXT,weight INTEGER);\
+INSERT INTO tbl_2_h VALUES('hen''chou','hc','很丑',100000);\
+CREATE TABLE tbl_1_c(key TEXT,jp TEXT,value TEXT,weight INTEGER);\
+INSERT INTO tbl_1_c VALUES('chou','c','丑',10000);\
+CREATE TABLE tbl_2_c(key TEXT,jp TEXT,value TEXT,weight INTEGER);\
+INSERT INTO tbl_2_c VALUES('chou''xiang','cx','抽象',100000);\
+CREATE TABLE tbl_1_x(key TEXT,jp TEXT,value TEXT,weight INTEGER);\
+INSERT INTO tbl_1_x VALUES('xiang','x','像',50000);\
+CREATE TABLE tbl_3_h(key TEXT,jp TEXT,value TEXT,weight INTEGER);",
+    );
+    let mut session = fixture.session();
+    type_text(&mut session, "henchoux");
+    assert_eq!(words(&session)[0], "很抽象");
+    let result = session.select(0);
+    assert_eq!(result.commit.as_deref(), Some("很抽象"));
+    assert_eq!(result.diagnostic, None);
+    assert!(session.snapshot().preedit.is_empty());
+    let stored: String = Connection::open(fixture.main_db())
+        .unwrap()
+        .query_row(
+            "SELECT key FROM tbl_3_h WHERE value='很抽象'",
+            (),
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, "hen'chou'xiang");
+    type_text(&mut session, "henchouxiang");
+    assert_eq!(words(&session)[0], "很抽象");
+}
+
 // ---- isolation between sessions (test_runtime_isolation.cpp:367-413, :447-464) ----
 
 /// One root of test_runtime_isolation.cpp:39-85: its own `ni` rows, quick phrase, helpcode tables and Japanese model, each naming `own` so a leak from the other root shows.

@@ -385,23 +385,17 @@ fn phrase_fixture() -> Fixture {
 }
 
 #[test]
-fn longer_phrases_join_the_full_key_group_by_weight() {
+fn complete_pinyin_keeps_homophones_without_longer_completions() {
     let fixture = phrase_fixture();
     let mut dictionary = QuanpinDictionary::new(&fixture.paths);
     let listed = query(&mut dictionary, "nihao", "ni'hao", NONE);
     assert_eq!(listed[0].word, "你好");
-    assert!(position(&listed, "你好吗") < position(&listed, "拟好"));
-    assert!(position(&listed, "你好啊呀") < position(&listed, "拟好"));
+    assert!(!contains(&listed, "你好吗"));
+    assert!(!contains(&listed, "你好啊呀"));
     assert!(
         position(&listed, "拟好") < position(&listed, "泥"),
         "a first-syllable character outranked a full spelling"
     );
-    let longer = &listed[position(&listed, "你好吗")];
-    assert_eq!(
-        longer.pinyin, "ni'hao",
-        "composition advance consumes only what was typed"
-    );
-    assert_eq!(longer.canonical_pinyin, "ni'hao'ma");
 
     let exact = query(&mut dictionary, "anquanbaowei", "an'quan'bao'wei", NONE);
     assert_eq!(
@@ -411,8 +405,8 @@ fn longer_phrases_join_the_full_key_group_by_weight() {
 }
 
 #[test]
-fn sentence_rows_follow_the_exact_hits_and_precede_longer_phrases() {
-    // quanpin.md §11.1: ping'guo lists 苹果, the sentence block, then 苹果电脑 苹果公司 评过 平果 平锅.
+fn sentence_rows_follow_all_exact_hits_without_longer_phrases() {
+    // 完整同音词排在生成句之前，较长补全不参与完整拼音的排序。
     let fixture = Fixture::new();
     fixture
         .insert("ping'guo", "苹果", 1_143_881)
@@ -427,18 +421,110 @@ fn sentence_rows_follow_the_exact_hits_and_precede_longer_phrases() {
     dictionary.set_sentence_alternatives(true);
     let listed = query(&mut dictionary, "pingguo", "ping'guo", NONE);
     assert_eq!(listed[0].word, "苹果");
-    let longer = position(&listed, "苹果电脑");
-    assert!(
-        longer > 1,
-        "the lattice block sits between the exact hit and the continuations"
-    );
-    assert!(listed[1..longer]
-        .iter()
-        .all(|item| item.source == CandidateSource::Generated && item.sentence_association));
+    assert_eq!(words(&listed[..4]), ["苹果", "评过", "平果", "平锅"]);
+    assert!(!contains(&listed, "苹果电脑"));
+    assert!(!contains(&listed, "苹果公司"));
+    assert!(position(&listed, "平国") >= 4);
+}
+
+#[test]
+fn full_initial_code_matches_six_syllables_even_with_zh_tail() {
+    let fixture = Fixture::new();
+    fixture
+        .insert("jin'tian'tian'qi'zhen'hao", "今天天气真好", 1000)
+        .insert("jin'tian'tian'qi", "今天天气", 10000)
+        .insert("jiao'tong'ting", "交通厅", 20000);
+    let mut dictionary = QuanpinDictionary::new(&fixture.paths);
+    let listed = query(&mut dictionary, "jttqzh", "", NONE);
+    assert_eq!(listed[0].word, "今天天气真好");
+    assert_eq!(listed[0].pinyin, "j't't'q'z'h");
+    assert_eq!(listed[0].canonical_pinyin, "jin'tian'tian'qi'zhen'hao");
     assert_eq!(
-        words(&listed[longer..longer + 5]),
-        ["苹果电脑", "苹果公司", "评过", "平果", "平锅"]
+        words(&listed)
+            .iter()
+            .filter(|word| **word == "今天天气真好")
+            .count(),
+        1
     );
+}
+
+#[test]
+fn mixed_jianpin_lattice_composes_an_unlisted_sentence() {
+    let fixture = Fixture::new();
+    fixture
+        .insert("hen", "很", 50_000)
+        .insert("hen'chou", "很丑", 100_000)
+        .insert("chou", "丑", 10_000)
+        .insert("chou'xiang", "抽象", 100_000)
+        .insert("xiang", "像", 50_000);
+    let mut dictionary = QuanpinDictionary::new(&fixture.paths);
+    let listed = query(&mut dictionary, "henchoux", "hen'chou'x", NONE);
+    assert_eq!(listed[0].word, "很抽象");
+    assert_eq!(listed[0].pinyin, "hen'chou'x");
+    assert_eq!(listed[0].canonical_pinyin, "hen'chou'xiang");
+    assert!(listed[0].sentence_association);
+    assert!(listed[0].corrected_from.is_empty());
+    assert!(contains(&listed, "很丑"));
+    // 完整拼音仍优先保留用户输入的同音词。
+    let exact = query(&mut dictionary, "henchou", "hen'chou", NONE);
+    assert_eq!(exact[0].word, "很丑");
+}
+
+#[test]
+fn mixed_jianpin_lattice_accepts_multiple_initials_and_requeries_after_edits() {
+    let fixture = Fixture::new();
+    fixture
+        .insert("ni", "你", 1000)
+        .insert("hao", "好", 1000)
+        .insert("ni'hao", "你好", 50_000)
+        .insert("shi'jie", "世界", 50_000);
+    let mut dictionary = QuanpinDictionary::new(&fixture.paths);
+    for _ in 0..2 {
+        let listed = query(&mut dictionary, "nihaosj", "ni'hao's'j", NONE);
+        assert_eq!(listed[0].word, "你好世界");
+        assert_eq!(listed[0].pinyin, "ni'hao's'j");
+        assert_eq!(listed[0].canonical_pinyin, "ni'hao'shi'jie");
+        let prefix = query(&mut dictionary, "nihao", "ni'hao", NONE);
+        assert_eq!(prefix[0].word, "你好");
+    }
+}
+
+#[test]
+fn mixed_jianpin_lattice_keeps_each_letter_of_a_retroflex_tail() {
+    let fixture = Fixture::new();
+    fixture
+        .insert("jin'tian", "今天", 50_000)
+        .insert("tian'qi", "天气", 50_000)
+        .insert("zhen'hao", "真好", 50_000);
+    let mut dictionary = QuanpinDictionary::new(&fixture.paths);
+    let listed = query(&mut dictionary, "jintiantqzh", "jin'tian't'q'zh", NONE);
+    assert_eq!(listed[0].word, "今天天气真好");
+    assert_eq!(listed[0].pinyin, "jin'tian't'q'z'h");
+    assert_eq!(listed[0].canonical_pinyin, "jin'tian'tian'qi'zhen'hao");
+}
+
+#[test]
+fn mixed_jianpin_lattice_keeps_one_stable_sentence_with_alternatives_enabled() {
+    let fixture = Fixture::new();
+    fixture
+        .insert("hen", "很", 50_000)
+        .insert("hen'chou", "很丑", 100_000)
+        .insert("chou'xiang", "抽象", 300_000)
+        .insert("xiang", "像", 50_000)
+        .insert("xia", "下", 80_000)
+        .insert("xiao", "小", 60_000);
+    let mut dictionary = QuanpinDictionary::new(&fixture.paths);
+    dictionary.set_sentence_alternatives(true);
+    let listed = query(&mut dictionary, "henchoux", "hen'chou'x", NONE);
+    assert_eq!(listed[0].word, "很抽象");
+    assert_eq!(
+        listed
+            .iter()
+            .filter(|item| item.sentence_association)
+            .count(),
+        1
+    );
+    assert!(contains(&listed, "很丑"));
 }
 
 #[test]

@@ -48,13 +48,20 @@ fn personal_probabilities(
     personal
 }
 
-/// The leading run, at most 16 rows, of dictionary rows with as many characters as the first (code points, like `count_utf8_chars`).
+/// 只重排首组同长度、同匹配拼音和同纠错类型的词库候选，最多 16 条；前缀与模糊音不能越过精确命中。
 fn leading_group_len(candidates: &[WordItem]) -> usize {
-    let characters = candidates[0].word.chars().count();
+    let first = &candidates[0];
+    let characters = first.word.chars().count();
     candidates
         .iter()
         .take(MAX_GROUP)
-        .take_while(|item| item.source.is_dictionary() && item.word.chars().count() == characters)
+        .take_while(|item| {
+            item.source.is_dictionary()
+                && item.word.chars().count() == characters
+                && item.pinyin == first.pinyin
+                && item.fuzzy == first.fuzzy
+                && item.corrected_from == first.corrected_from
+        })
         .count()
 }
 
@@ -235,6 +242,59 @@ mod tests {
 
         let long: Vec<WordItem> = (0..20).map(|index| row("字", index)).collect();
         assert_eq!(leading_group_len(&long), MAX_GROUP);
+    }
+
+    #[test]
+    fn a_frequent_prefix_cannot_displace_the_complete_spelling() {
+        let mut model = PersonalNgram::default();
+        model.add_pair("甲", "个", 64);
+        let candidates = [
+            WordItem::new("gei", "给", 100, CandidateSource::Database, "gei"),
+            WordItem::new("ge", "个", 1000, CandidateSource::Database, "ge"),
+        ];
+
+        assert_eq!(
+            personal_context_rerank(&candidates, &model, None, "甲", &mut never_pinned()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_fuzzy_reading_cannot_displace_the_exact_reading() {
+        let mut model = PersonalNgram::default();
+        model.add_pair("甲", "冷", 64);
+        let mut fuzzy = WordItem::new("neng", "冷", 1000, CandidateSource::Database, "leng");
+        fuzzy.fuzzy = true;
+        let candidates = [
+            WordItem::new("neng", "能", 100, CandidateSource::Database, "neng"),
+            fuzzy,
+        ];
+
+        assert_eq!(
+            personal_context_rerank(&candidates, &model, None, "甲", &mut never_pinned()),
+            None
+        );
+    }
+
+    #[test]
+    fn corrected_rows_do_not_join_the_literal_group() {
+        let mut candidates = vec![row("甲", 100), row("乙", 10)];
+        candidates[1].corrected_from = "mi".to_owned();
+        assert_eq!(leading_group_len(&candidates), 1);
+    }
+
+    #[test]
+    fn initial_matches_keep_context_ranking_across_complete_readings() {
+        let mut model = PersonalNgram::default();
+        model.add_pair("甲", "吧", 64);
+        let candidates = [
+            WordItem::new("b", "不", 100, CandidateSource::Database, "bu"),
+            WordItem::new("b", "吧", 10, CandidateSource::Database, "ba"),
+        ];
+
+        let ordered = personal_context_rerank(&candidates, &model, None, "甲", &mut never_pinned())
+            .expect("简拼候选仍应参与上下文调频");
+        assert_eq!(ordered[0].word, "吧");
     }
 }
 

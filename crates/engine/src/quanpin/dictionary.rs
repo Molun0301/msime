@@ -29,7 +29,9 @@ use crate::pinyin::fuzzy::{fuzzy_segmentations, FUZZY_SEGMENTATION_LIMIT};
 use crate::pinyin::graph::{
     build_syllable_graph, enumerate_complete_segmentations, SYLLABLE_GRAPH_PATH_LIMIT,
 };
-use crate::pinyin::jianpin::QuerySource;
+use crate::pinyin::jianpin::{
+    expand_mixed_pinyin_initials, has_mixed_pinyin_segments, QuerySource,
+};
 use crate::pinyin::segment::{
     cut_pinyin_by_mode, is_complete_pinyin_input, join_segments, split_segments, CutMode,
 };
@@ -690,18 +692,50 @@ impl QuanpinDictionary {
             let partial = &segments[..count];
             let mut rows = self.query_single_path(raw, &partial_segmentation, partial);
             if count == segments.len() {
-                // The same-length table often holds only leftovers: all of ping'guo is 苹果 1143881, 评过 1180, 平果 169, 平锅 1, while 苹果电脑 21495 and 苹果公司 19725 sit in tbl_4_p, which a same-length query never sees, so the second seat went to a rare homophone. Continuations join the group by weight, which comes from one corpus and compares across tables. `pinyin` stays the typed string (composition advance consumes only what was typed) and `canonical_pinyin` keeps the full reading for persistence.
-                let longer = self.longer_phrase_candidates(&partial_segmentation, partial);
-                if !longer.is_empty() {
-                    rows.extend(longer);
-                    rows.sort_by_key(|item| std::cmp::Reverse(item.weight));
+                // 完整拼音命中整词时只显示同音整词，避免高频长词挤占候选，也让整句插入位置识别到精确命中。
+                let exact = has_only_complete_pinyin_segments(partial)
+                    && rows
+                        .iter()
+                        .any(|item| item.canonical_pinyin == partial_segmentation);
+                if exact {
+                    rows.retain(|item| item.canonical_pinyin == partial_segmentation);
+                } else {
+                    let longer = self.longer_phrase_candidates(&partial_segmentation, partial);
+                    if !longer.is_empty() {
+                        rows.extend(longer);
+                        rows.sort_by_key(|item| std::cmp::Reverse(item.weight));
+                    }
                 }
             }
             Self::append_query_rows(&mut result, rows);
         }
 
-        if segments.len() >= 2 && has_only_complete_pinyin_segments(segments) {
+        if segments.len() >= 2
+            && (has_only_complete_pinyin_segments(segments) || has_mixed_pinyin_segments(segments))
+        {
             self.merge_sentences(&mut result, raw, segmentation, segments);
+        }
+
+        if !raw.contains('\'') {
+            if let Some(expanded) = expand_mixed_pinyin_initials(segments) {
+                let expanded_key = join_segments(&expanded);
+                let mut rows = self.query_single_path(raw, &expanded_key, &expanded);
+                self.merge_sentences(&mut rows, raw, &expanded_key, &expanded);
+                append_unique_words(&mut rows, result);
+                result = rows;
+            }
+        }
+        if has_mixed_pinyin_segments(segments) {
+            // 缩写跨度歧义很大，只保留最佳组词整句；避免停顿重排把它跳换成低质量扩写，词库整词候选仍全部保留。
+            let mut sentence_seen = false;
+            result.retain(|item| {
+                if !item.sentence_association {
+                    return true;
+                }
+                let keep = !sentence_seen;
+                sentence_seen = true;
+                keep
+            });
         }
 
         if result.len() < SPARSE_FALLBACK_THRESHOLD {
@@ -713,6 +747,26 @@ impl QuanpinDictionary {
                 let rows = self.query_single_path(raw, &fallback_segmentation, &fallback);
                 append_unique_words(&mut result, rows);
             }
+        }
+        // 纯辅音输入同时按一个字母一个音节查整词；zh/ch/sh 的常规切分不能吞掉六字等长简拼。
+        if raw.len() >= 2
+            && raw
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() && !b"aeiouv".contains(&byte))
+            && !has_only_complete_pinyin_segments(segments)
+        {
+            let code = raw.to_owned();
+            let matched = raw
+                .chars()
+                .map(|ch| ch.to_string())
+                .collect::<Vec<_>>()
+                .join("'");
+            let mut initials = self.query_jianpin_codes(&[code], 100);
+            for item in &mut initials {
+                item.pinyin.clone_from(&matched);
+            }
+            append_unique_words(&mut initials, result);
+            result = initials;
         }
         result
     }
@@ -733,6 +787,9 @@ impl QuanpinDictionary {
         let personal = Arc::clone(&self.personal);
         let model = personal.model();
         let mut options = make_sentence_lattice_options(&self.paths, self.sentence_alternatives);
+        if has_mixed_pinyin_segments(segments) {
+            options.emit = 1;
+        }
         if !self.rerankers.is_empty() {
             options.nbest = MAX_RERANK_PATHS;
         }

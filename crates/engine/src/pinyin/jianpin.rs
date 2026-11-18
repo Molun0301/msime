@@ -12,6 +12,62 @@ fn is_shuangpin_initial_token(segment: &str) -> bool {
     matches!(segment, "zh" | "ch" | "sh")
 }
 
+/// 可独立代表一个音节的声母缩写；元音必须按完整音节处理。
+pub fn is_pinyin_initial(segment: &str) -> bool {
+    is_shuangpin_initial_token(segment)
+        || (segment.len() == 1
+            && segment.as_bytes()[0].is_ascii_lowercase()
+            && !b"aeiouv".contains(&segment.as_bytes()[0]))
+}
+
+/// 混输整句必须以完整音节开头，后续每段只能是完整音节或声母，且确实包含缩写。
+pub fn has_mixed_pinyin_segments(segments: &[String]) -> bool {
+    segments.first().is_some_and(|segment| is_intact(segment))
+        && segments.iter().any(|segment| !is_intact(segment))
+        && segments
+            .iter()
+            .all(|segment| is_intact(segment) || is_pinyin_initial(segment))
+}
+
+/// 无手动分隔的混输尾部允许逐字母解释翘舌声母，只增加这一条切分，不枚举组合。
+pub fn expand_mixed_pinyin_initials(segments: &[String]) -> Option<Vec<String>> {
+    if !has_mixed_pinyin_segments(segments)
+        || !segments
+            .iter()
+            .any(|segment| is_shuangpin_initial_token(segment))
+    {
+        return None;
+    }
+    Some(
+        segments
+            .iter()
+            .flat_map(|segment| {
+                if is_shuangpin_initial_token(segment) {
+                    segment.chars().map(|letter| letter.to_string()).collect()
+                } else {
+                    vec![segment.clone()]
+                }
+            })
+            .collect(),
+    )
+}
+
+/// 词格必须保留一段一音节的完整词典读音；完整音节严格匹配，声母只匹配对应音节的开头。
+pub fn matches_lattice_segments(key: &str, segments: &[String]) -> bool {
+    let mut actual = key.split('\'');
+    segments.iter().all(|expected| {
+        let Some(syllable) = actual.next() else {
+            return false;
+        };
+        is_intact(syllable)
+            && if is_intact(expected) {
+                syllable == expected
+            } else {
+                is_pinyin_initial(expected) && syllable.starts_with(expected)
+            }
+    }) && actual.next().is_none()
+}
+
 /// Every segment has length 1.
 pub fn is_pure_jianpin(segments: &[String]) -> bool {
     segments.iter().all(|segment| segment.len() == 1)
@@ -138,6 +194,41 @@ mod tests {
         assert!(can_match_exact_key(&segments(&["ni", "hao"])));
         assert!(!can_match_exact_key(&segments(&["ni", "h"])));
         assert!(!can_match_exact_key(&[]));
+    }
+
+    #[test]
+    fn mixed_lattice_spelling_keeps_complete_syllables_strict() {
+        assert!(has_mixed_pinyin_segments(&segments(&["hen", "chou", "x"])));
+        assert!(has_mixed_pinyin_segments(&segments(&[
+            "ni", "h", "shi", "j"
+        ])));
+        assert!(!has_mixed_pinyin_segments(&segments(&["n", "h"])));
+        assert!(!has_mixed_pinyin_segments(&segments(&["ni", "hao"])));
+        assert!(!has_mixed_pinyin_segments(&segments(&["ni", "xyz"])));
+        assert!(matches_lattice_segments(
+            "hen'chou'xiang",
+            &segments(&["hen", "chou", "x"])
+        ));
+        assert!(!matches_lattice_segments(
+            "heng'chou'xiang",
+            &segments(&["hen", "chou", "x"])
+        ));
+        assert!(!matches_lattice_segments(
+            "gun'qiu",
+            &segments(&["gun", "qi"])
+        ));
+        assert!(matches_lattice_segments(
+            "gun'qiu",
+            &segments(&["gun", "q"])
+        ));
+        assert!(!matches_lattice_segments(
+            "hen'chou'x",
+            &segments(&["hen", "chou", "x"])
+        ));
+        assert!(!matches_lattice_segments(
+            "hen'chou'xiang'a",
+            &segments(&["hen", "chou", "x"])
+        ));
     }
 
     #[test]

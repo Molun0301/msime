@@ -23,6 +23,7 @@ use crate::ordering::apply_order;
 use crate::paths::RuntimePaths;
 use crate::pinyin::jianpin::QuerySource;
 use crate::pinyin::segment::split_segments;
+use crate::pinyin::syllables::has_only_complete_pinyin_segments;
 use crate::quanpin::dictionary::{CACHE_CAPACITY, INITIAL_CANDIDATE_LIMIT};
 use crate::text::last_characters;
 use crate::types::{CandidateSource, SentenceAssociationOptions, WordItem};
@@ -268,6 +269,10 @@ impl ShuangpinDictionary {
         typed: &str,
     ) {
         let word_lattice = self.sentence_association.word_lattice;
+        // 双拼尾键可能是辅助码，不能按全拼声母混输补成额外的汉字。
+        if !has_only_complete_pinyin_segments(segments) {
+            return;
+        }
         if !word_lattice && self.rerankers.is_empty() {
             return;
         }

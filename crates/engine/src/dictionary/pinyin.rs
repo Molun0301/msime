@@ -10,8 +10,9 @@ use super::{column_i64, column_text, sql_limit, DictRow};
 use crate::error::{EngineError, Result};
 use crate::format::{build_table_name, quanpin_table, SHIPPED_INITIALS};
 use crate::pinyin::jianpin::{
-    build_key_like_pattern, build_mixed_jianpin_scan_limit, can_match_exact_key, is_pure_jianpin,
-    key_prefix_upper_bound, matches_mixed_segments, needs_mixed_jianpin_query, QuerySource,
+    build_key_like_pattern, build_mixed_jianpin_scan_limit, can_match_exact_key, is_pinyin_initial,
+    is_pure_jianpin, key_prefix_upper_bound, matches_lattice_segments, matches_mixed_segments,
+    needs_mixed_jianpin_query, QuerySource,
 };
 use crate::pinyin::segment::{join_segments, segments_to_jianpin, split_segments};
 use crate::pinyin::syllables::{
@@ -296,13 +297,31 @@ impl PinyinDatabase {
         rows
     }
 
-    /// The lattice's span lookup: each syllable canonicalised with `canonical_lattice_syllable`, then an exact-key lookup only, so `gun'qi` never borrows `gun'qiu`'s rows (QQ:1398-1418).
+    /// 完整音节精确查询；声母跨度按简拼索引限量召回，逐段核对完整读音，避免 `gun'qi` 借用 `gun'qiu`。
     pub fn query_lattice_span(&self, span: &[String], span_limit: usize) -> Vec<DictRow> {
+        if span_limit == 0 {
+            return Vec::new();
+        }
         let normalized: Vec<String> = span
             .iter()
             .map(|syllable| canonical_lattice_syllable(syllable).to_owned())
             .collect();
-        self.query_exact_segmentations_keyed_flat(&[normalized], span_limit)
+        if has_only_complete_pinyin_segments(&normalized) {
+            return self.query_exact_segmentations_keyed_flat(&[normalized], span_limit);
+        }
+        if normalized.is_empty()
+            || !normalized.iter().all(|segment| {
+                intact_pinyin_set().contains(segment.as_str()) || is_pinyin_initial(segment)
+            })
+        {
+            return Vec::new();
+        }
+        let code = segments_to_jianpin(&normalized);
+        self.query_jianpin_codes(&[code], build_mixed_jianpin_scan_limit(span_limit))
+            .into_iter()
+            .filter(|row| matches_lattice_segments(&row.key, &normalized))
+            .take(span_limit)
+            .collect()
     }
 
     /// Whether any shipped single-character table holds `han` (QQ:1017-1050).
@@ -1283,7 +1302,7 @@ mod tests {
             .is_empty());
     }
 
-    // test_pinyin.cpp:640-665: the real lookup never hands the lattice a prefix row and canonicalises the accepted ü spellings first.
+    // 完整音节不扩写，缩写可召回完整读音；先统一 ü 的别名。
     #[test]
     fn lattice_span_is_exact_and_canonicalises_umlaut_spellings() {
         let directory = tempfile::tempdir().unwrap();
@@ -1291,10 +1310,10 @@ mod tests {
         let connection = Connection::open(&path).unwrap();
         connection
             .execute_batch(
-                "CREATE TABLE tbl_2_g (key TEXT, value TEXT, weight INTEGER);
+                "CREATE TABLE tbl_2_g (key TEXT, jp TEXT, value TEXT, weight INTEGER);
                  CREATE TABLE tbl_1_j (key TEXT, value TEXT, weight INTEGER);
                  CREATE TABLE tbl_1_l (key TEXT, value TEXT, weight INTEGER);
-                 INSERT INTO tbl_2_g VALUES ('gun''qiu', '滚球', 30000), ('gun''qi', '滚起', 12000);
+                 INSERT INTO tbl_2_g VALUES ('gun''qiu', 'gq', '滚球', 30000), ('gun''qi', 'gq', '滚起', 12000);
                  INSERT INTO tbl_1_j VALUES ('ju', '居', 10000);
                  INSERT INTO tbl_1_l VALUES ('lve', '略', 10000);",
             )
@@ -1317,9 +1336,10 @@ mod tests {
             values(&database.query_lattice_span(&strings(&["lue"]), 32)),
             ["略"]
         );
-        assert!(database
-            .query_lattice_span(&strings(&["gun", "q"]), 32)
-            .is_empty());
+        assert_eq!(
+            values(&database.query_lattice_span(&strings(&["gun", "q"]), 32)),
+            ["滚球", "滚起"]
+        );
     }
 
     #[test]
